@@ -1,0 +1,10 @@
+[package]
+name = "flux"
+version = "0.1.0"
+edition = "2021"
+description = "A Netty-like event-driven networking framework for Rust"
+
+[dependencies]
+mio = { version = "1", features = ["net", "os-poll", "os-ext"] }
+log = "0.4"
+ctrlc = "3"
