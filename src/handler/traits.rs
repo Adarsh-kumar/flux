@@ -11,12 +11,16 @@ use super::context::HandlerContext;
 /// Every method has a default no-op implementation — override only the
 /// events you care about. Handlers are invoked in insertion order.
 ///
-/// ## Type-based dispatch
+/// ## Type-based routing
 ///
 /// Override [`accepted_types`] to declare which message types this handler
 /// handles. The pipeline calls `on_read` only for matching types. Return an
 /// empty `Vec` to receive **all** types (the default — useful for loggers
 /// and pass-through handlers).
+///
+/// A negotiation handler is simply an inbound handler that accepts the
+/// negotiation message type. The decoder produces the right type; the
+/// framework routes it here. No propagation control is needed.
 ///
 /// ```ignore
 /// use std::any::TypeId;
@@ -35,12 +39,7 @@ use super::context::HandlerContext;
 /// }
 /// ```
 ///
-/// ## Propagation control
-///
-/// Call [`HandlerContext::stop_inbound`] to halt further propagation.
-///
 /// [`accepted_types`]: InboundHandler::accepted_types
-/// [`HandlerContext::stop_inbound`]: super::context::HandlerContext::stop_inbound
 pub trait InboundHandler: Send + 'static {
     /// Return the set of message `TypeId`s this handler processes.
     ///

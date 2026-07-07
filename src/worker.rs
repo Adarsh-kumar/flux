@@ -309,8 +309,7 @@ impl Worker {
                     return;
                 }
                 Ok(n) => {
-                    let msg: Box<dyn std::any::Any> = Box::new(read_buf[..n].to_vec());
-                    if self.executor.fire_read(&session, &*msg) {
+                    if self.executor.fire_read(&session, &read_buf[..n]) {
                         self.terminate(session);
                         return;
                     }

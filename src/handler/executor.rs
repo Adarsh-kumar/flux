@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::io;
 
 use super::context::HandlerContext;
@@ -18,19 +17,20 @@ impl PipelineExecutor {
         session.pipeline().borrow_mut().fire_connect(&mut ctx);
     }
 
-    pub fn fire_read(&self, session: &Session, msg: &dyn Any) -> bool {
+    /// Decode `bytes` into typed messages and dispatch each through the pipeline.
+    ///
+    /// Returns `true` if any handler requested the session be closed.
+    pub fn fire_read(&self, session: &Session, bytes: &[u8]) -> bool {
         let mut ctx = HandlerContext::new(session);
         let mut pipeline = session.pipeline().borrow_mut();
 
-        // Decode bytes into messages (identity pass-through when no decoder).
-        let bytes = msg
-            .downcast_ref::<Vec<u8>>()
-            .expect("worker always sends Vec<u8>");
         let messages = pipeline.decode(bytes);
 
         for msg in &messages {
-            ctx.inbound_blocked = false;
             pipeline.fire_read(&mut ctx, msg.as_ref());
+            if ctx.close_requested {
+                break;
+            }
         }
 
         ctx.close_requested

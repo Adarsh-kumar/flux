@@ -19,12 +19,12 @@ use super::traits::{ByteToMessageDecoder, InboundHandler, OutboundHandler};
 ///   Handler N → ... → Handler 1 → Handler 0   (reverse order)
 /// ```
 ///
-/// ## Propagation control
+/// ## Routing
 ///
-/// By default, events flow through *every* handler. A handler calls
-/// [`HandlerContext::stop_inbound`] or [`HandlerContext::stop_outbound`]
-/// to halt the chain. This is how NegoHandler will prevent downstream
-/// handlers from processing data before negotiation completes.
+/// The framework routes each decoded message to handlers by type. A handler's
+/// [`InboundHandler::accepted_types`] declares which message types it handles.
+/// Return an empty slice to receive all types. Handlers never need to call
+/// `stop_inbound` — the type system provides the gate.
 ///
 /// ## Lifecycle
 ///
@@ -33,8 +33,7 @@ use super::traits::{ByteToMessageDecoder, InboundHandler, OutboundHandler};
 /// [`fire_connect`] is called. The pipeline lives until the connection
 /// is dropped.
 ///
-/// [`HandlerContext::stop_inbound`]: super::context::HandlerContext::stop_inbound
-/// [`HandlerContext::stop_outbound`]: super::context::HandlerContext::stop_outbound
+/// [`InboundHandler::accepted_types`]: super::traits::InboundHandler::accepted_types
 /// [`fire_connect`]: Pipeline::fire_connect
 pub struct Pipeline {
     inbound: Vec<Box<dyn InboundHandler>>,
@@ -111,9 +110,6 @@ impl Pipeline {
     pub(crate) fn fire_connect(&mut self, ctx: &mut HandlerContext<'_>) {
         for handler in &mut self.inbound {
             handler.on_connect(ctx);
-            if ctx.inbound_blocked {
-                break;
-            }
         }
     }
 
@@ -128,9 +124,6 @@ impl Pipeline {
                 continue;
             }
             handler.on_read(ctx, msg);
-            if ctx.inbound_blocked {
-                break;
-            }
         }
     }
 
@@ -138,9 +131,6 @@ impl Pipeline {
     pub(crate) fn fire_disconnect(&mut self, ctx: &mut HandlerContext<'_>) {
         for handler in &mut self.inbound {
             handler.on_disconnect(ctx);
-            if ctx.inbound_blocked {
-                break;
-            }
         }
     }
 
@@ -148,9 +138,6 @@ impl Pipeline {
     pub(crate) fn fire_error(&mut self, ctx: &mut HandlerContext<'_>, err: &std::io::Error) {
         for handler in &mut self.inbound {
             handler.on_error(ctx, err);
-            if ctx.inbound_blocked {
-                break;
-            }
         }
     }
 
@@ -160,9 +147,6 @@ impl Pipeline {
     pub(crate) fn fire_write(&mut self, ctx: &mut HandlerContext<'_>, data: &[u8]) {
         for handler in self.outbound.iter_mut().rev() {
             handler.on_write(ctx, data);
-            if ctx.outbound_blocked {
-                break;
-            }
         }
     }
 }
