@@ -267,7 +267,12 @@ impl Worker {
             // 4. Fire on_connect through the pipeline.
             self.executor.fire_connect(&session);
 
-            // 5. Insert into the connection map.
+            // 5. If on_connect wrote data, register WRITABLE immediately so
+            //    the worker can flush it without waiting for the client to
+            //    send first (which may never happen for server-push patterns).
+            update_writable(&self.poll, &mut session, token, self.id);
+
+            // 6. Insert into the connection map.
             self.connections.insert(token, session);
                 }
                 Err(TryRecvError::Empty) => return true,
@@ -400,6 +405,7 @@ impl Worker {
         let mut buf = [0u8; 64];
         loop {
             match self.pipe_rx.read(&mut buf) {
+                Ok(0) => break, // EOF: pipe sender closed (boss shutdown)
                 Ok(_) => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,

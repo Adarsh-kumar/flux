@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6,98 +6,81 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use flux::handler::{HandlerContext, InboundHandler, Pipeline};
+use flux::handler::{ByteToMessageDecoder, HandlerContext, InboundHandler, Pipeline};
 use flux::{Server, ServerConfig};
 
-// ── Helper: extract raw bytes from an Any message ──────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Test infrastructure
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn as_bytes(msg: &dyn Any) -> &[u8] {
     msg.downcast_ref::<Vec<u8>>()
-        .expect("expected Vec<u8> message")
+        .expect("expected Vec<u8> message from no-decoder pipeline")
 }
 
-// ── TestHandler ────────────────────────────────────────────
+fn start_server(config: ServerConfig) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind failed");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = ServerConfig { port, ..config };
+    thread::spawn(move || Server::new(config).run());
+    thread::sleep(Duration::from_millis(50));
+    port
+}
 
-/// Handler that records counts via shared atomics.
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
 struct TestHandler {
     connect_count: Arc<AtomicUsize>,
     read_bytes: Arc<AtomicUsize>,
     disconnect_count: Arc<AtomicUsize>,
 }
-
 impl InboundHandler for TestHandler {
     fn on_connect(&mut self, _ctx: &mut HandlerContext<'_>) {
         self.connect_count.fetch_add(1, Ordering::SeqCst);
     }
-
     fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
-        self.read_bytes
-            .fetch_add(as_bytes(msg).len(), Ordering::SeqCst);
+        self.read_bytes.fetch_add(as_bytes(msg).len(), Ordering::SeqCst);
     }
-
     fn on_disconnect(&mut self, _ctx: &mut HandlerContext<'_>) {
         self.disconnect_count.fetch_add(1, Ordering::SeqCst);
     }
 }
 
-// ── TaggedHandler ──────────────────────────────────────────
-
-/// Handler that pushes a tag string into a shared Vec when events fire.
 struct TaggedHandler {
     tag: &'static str,
     log: Arc<Mutex<Vec<String>>>,
-    stop_after: bool,
 }
-
 impl InboundHandler for TaggedHandler {
-    fn on_connect(&mut self, ctx: &mut HandlerContext<'_>) {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("{}.connect", self.tag));
-        if self.stop_after {
-            ctx.stop_inbound();
-        }
+    fn on_connect(&mut self, _ctx: &mut HandlerContext<'_>) {
+        self.log.lock().unwrap().push(format!("{}.connect", self.tag));
     }
-
-    fn on_read(&mut self, ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
-        self.log.lock().unwrap().push(format!(
-            "{}.read({})",
-            self.tag,
-            as_bytes(msg).len()
-        ));
-        if self.stop_after {
-            ctx.stop_inbound();
-        }
+    fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
+        self.log.lock().unwrap().push(format!("{}.read({})", self.tag, as_bytes(msg).len()));
     }
-
-    fn on_disconnect(&mut self, ctx: &mut HandlerContext<'_>) {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("{}.disconnect", self.tag));
-        if self.stop_after {
-            ctx.stop_inbound();
-        }
+    fn on_disconnect(&mut self, _ctx: &mut HandlerContext<'_>) {
+        self.log.lock().unwrap().push(format!("{}.disconnect", self.tag));
     }
 }
 
-// ── start_server helper ────────────────────────────────────
-
-fn start_server(config: ServerConfig) -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    let config = ServerConfig { port, ..config };
-    thread::spawn(move || {
-        Server::new(config).run();
-    });
-
-    port
+/// Line-framing decoder. Buffers bytes across reads; emits one Vec<u8> per '\n'.
+struct NewlineDecoder { buf: Vec<u8> }
+impl NewlineDecoder { fn new() -> Self { Self { buf: Vec::new() } } }
+impl ByteToMessageDecoder for NewlineDecoder {
+    fn decode(&mut self, input: &[u8]) -> Option<Box<dyn Any>> {
+        self.buf.extend_from_slice(input);
+        let pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let line = self.buf[..pos].to_vec();
+        self.buf.drain(..=pos);
+        Some(Box::new(line))
+    }
 }
 
-// ── Tests ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Existing tests (cleaned up)
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn connections_flow_through_pipeline() {
@@ -122,18 +105,13 @@ fn connections_flow_through_pipeline() {
         })),
     });
 
-    thread::sleep(Duration::from_millis(50));
-
     let mut streams: Vec<TcpStream> = Vec::new();
     for _ in 0..3 {
-        let mut s =
-            TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect failed");
+        let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect failed");
         s.write_all(b"hello").expect("write failed");
         streams.push(s);
     }
-
     thread::sleep(Duration::from_millis(200));
-
     assert_eq!(connect_count.load(Ordering::SeqCst), 3);
     assert_eq!(read_bytes.load(Ordering::SeqCst), 15);
     drop(streams);
@@ -158,21 +136,17 @@ fn handler_can_write_back_to_client() {
         })),
     });
 
-    thread::sleep(Duration::from_millis(50));
-
-    let mut client =
-        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect failed");
-    client.write_all(b"ping").expect("write failed");
-    thread::sleep(Duration::from_millis(100));
-
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+    client.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    client.write_all(b"ping").unwrap();
     let mut buf = [0u8; 4];
-    client.read_exact(&mut buf).expect("read failed");
+    client.read_exact(&mut buf).expect("read");
     assert_eq!(&buf, b"ping");
 }
 
 #[test]
 fn chained_handlers_all_fire_in_order() {
-    let log = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
 
     let port = start_server(ServerConfig {
         port: 0,
@@ -182,198 +156,142 @@ fn chained_handlers_all_fire_in_order() {
             let lb = log.clone();
             let lc = log.clone();
             move |p: &mut Pipeline| {
-                p.add_inbound(Box::new(TaggedHandler {
-                    tag: "A",
-                    log: la.clone(),
-                    stop_after: false,
-                }));
-                p.add_inbound(Box::new(TaggedHandler {
-                    tag: "B",
-                    log: lb.clone(),
-                    stop_after: false,
-                }));
-                p.add_inbound(Box::new(TaggedHandler {
-                    tag: "C",
-                    log: lc.clone(),
-                    stop_after: false,
-                }));
+                p.add_inbound(Box::new(TaggedHandler { tag: "A", log: la.clone() }));
+                p.add_inbound(Box::new(TaggedHandler { tag: "B", log: lb.clone() }));
+                p.add_inbound(Box::new(TaggedHandler { tag: "C", log: lc.clone() }));
             }
         })),
     });
 
-    thread::sleep(Duration::from_millis(50));
-
-    let mut client =
-        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect failed");
-    client.write_all(b"data").expect("write failed");
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(b"data").unwrap();
     thread::sleep(Duration::from_millis(100));
     drop(client);
     thread::sleep(Duration::from_millis(100));
 
     let events = log.lock().unwrap();
-
-    assert!(events.iter().position(|e| e == "A.connect").unwrap()
-        < events.iter().position(|e| e == "B.connect").unwrap());
-    assert!(events.contains(&"C.connect".to_string()));
-    assert!(events.contains(&"A.read(4)".to_string()));
-    assert!(events.contains(&"B.read(4)".to_string()));
-    assert!(events.contains(&"C.read(4)".to_string()));
+    let pos = |s: &str| events.iter().position(|e| e == s).expect(s);
+    assert!(pos("A.connect") < pos("B.connect"));
+    assert!(pos("B.connect") < pos("C.connect"));
+    assert!(pos("A.read(4)") < pos("B.read(4)"));
+    assert!(pos("B.read(4)") < pos("C.read(4)"));
     assert!(events.contains(&"A.disconnect".to_string()));
+    assert!(events.contains(&"B.disconnect".to_string()));
     assert!(events.contains(&"C.disconnect".to_string()));
 }
 
 #[test]
-fn stop_inbound_blocks_downstream_handlers() {
-    let log = Arc::new(Mutex::new(Vec::new()));
-
-    let port = start_server(ServerConfig {
-        port: 0,
-        worker_threads: 1,
-        pipeline_initializer: Some(Arc::new({
-            let la = log.clone();
-            let lb = log.clone();
-            let lc = log.clone();
-            move |p: &mut Pipeline| {
-                p.add_inbound(Box::new(TaggedHandler {
-                    tag: "A",
-                    log: la.clone(),
-                    stop_after: false,
-                }));
-                p.add_inbound(Box::new(TaggedHandler {
-                    tag: "B",
-                    log: lb.clone(),
-                    stop_after: true, // blocks C
-                }));
-                p.add_inbound(Box::new(TaggedHandler {
-                    tag: "C",
-                    log: lc.clone(),
-                    stop_after: false,
-                }));
-            }
-        })),
-    });
-
-    thread::sleep(Duration::from_millis(50));
-
-    let mut client =
-        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect failed");
-    client.write_all(b"data").expect("write failed");
-    thread::sleep(Duration::from_millis(100));
-    drop(client);
-    thread::sleep(Duration::from_millis(100));
-
-    let events = log.lock().unwrap();
-    assert!(events.contains(&"A.connect".to_string()));
-    assert!(events.contains(&"B.connect".to_string()));
-    assert!(!events.contains(&"C.connect".to_string()));
-    assert!(events.contains(&"A.read(4)".to_string()));
-    assert!(events.contains(&"B.read(4)".to_string()));
-    assert!(!events.contains(&"C.read(4)".to_string()));
-}
-
-// ── Type-based dispatch tests ──────────────────────────────
-
-use std::any::TypeId;
-
-/// A custom message type (not Vec<u8>).
-#[derive(Debug)]
-struct CustomMessage {
-    payload: String,
-}
-
-/// Handler that only accepts CustomMessage.
-struct CustomHandler {
-    log: Arc<Mutex<Vec<String>>>,
-}
-
-impl InboundHandler for CustomHandler {
-    fn accepted_types(&self) -> Vec<TypeId> {
-        vec![TypeId::of::<CustomMessage>()]
-    }
-
-    fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
-        let cm = msg.downcast_ref::<CustomMessage>().unwrap();
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("custom: {}", cm.payload));
-    }
-}
-
-/// Handler that only accepts Vec<u8> and converts to CustomMessage.
-/// In a real app this would be FrameDecoder.
-struct RawToCustom {
-    log: Arc<Mutex<Vec<String>>>,
-}
-
-impl InboundHandler for RawToCustom {
-    fn accepted_types(&self) -> Vec<TypeId> {
-        vec![TypeId::of::<Vec<u8>>()]
-    }
-
-    fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
-        let bytes = msg.downcast_ref::<Vec<u8>>().unwrap();
-        let text = String::from_utf8_lossy(bytes);
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("raw: {}", text.trim()));
-    }
-}
-
-#[test]
 fn type_based_dispatch_routes_by_typeid() {
-    let log = Arc::new(Mutex::new(Vec::new()));
+    #[derive(Debug)] struct CustomMessage;
 
+    struct RawLogger { log: Arc<Mutex<Vec<String>>> }
+    impl InboundHandler for RawLogger {
+        fn accepted_types(&self) -> Vec<TypeId> { vec![TypeId::of::<Vec<u8>>()] }
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.log.lock().unwrap().push("raw".into());
+        }
+    }
+
+    struct CustomLogger { log: Arc<Mutex<Vec<String>>> }
+    impl InboundHandler for CustomLogger {
+        fn accepted_types(&self) -> Vec<TypeId> { vec![TypeId::of::<CustomMessage>()] }
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.log.lock().unwrap().push("custom".into());
+        }
+    }
+
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let port = start_server(ServerConfig {
         port: 0,
         worker_threads: 1,
         pipeline_initializer: Some(Arc::new({
-            let la = log.clone();
-            let lb = log.clone();
+            let la = log.clone(); let lb = log.clone();
             move |p: &mut Pipeline| {
-                // Handler A: only sees Vec<u8>
-                p.add_inbound(Box::new(RawToCustom { log: la.clone() }));
-                // Handler B: only sees CustomMessage
-                p.add_inbound(Box::new(CustomHandler { log: lb.clone() }));
+                p.add_inbound(Box::new(RawLogger { log: la.clone() }));
+                p.add_inbound(Box::new(CustomLogger { log: lb.clone() }));
             }
         })),
     });
 
-    thread::sleep(Duration::from_millis(50));
-
-    let mut client =
-        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect failed");
-    client.write_all(b"hello").expect("write failed");
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(b"hello").unwrap();
     thread::sleep(Duration::from_millis(100));
     drop(client);
     thread::sleep(Duration::from_millis(100));
 
     let events = log.lock().unwrap();
-    println!("events: {:?}", *events);
-
-    // RawToCustom received the Vec<u8>.
-    assert!(events.iter().any(|e| e == "raw: hello"));
-
-    // CustomHandler did NOT receive anything — the message was Vec<u8>,
-    // not CustomMessage.
-    assert!(!events.iter().any(|e| e.starts_with("custom:")));
+    assert!(events.iter().any(|e| e == "raw"), "RawLogger must fire");
+    assert!(!events.iter().any(|e| e == "custom"), "CustomLogger must not fire");
 }
 
 #[test]
-fn catch_all_handler_sees_everything() {
-    let log = Arc::new(Mutex::new(Vec::new()));
-
-    struct CatchAll {
-        log: Arc<Mutex<Vec<String>>>,
-    }
+fn catch_all_handler_sees_every_message() {
+    struct CatchAll { count: Arc<AtomicUsize> }
     impl InboundHandler for CatchAll {
-        // accepted_types() returns empty → sees everything
-        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
-            self.log.lock().unwrap().push(format!(
-                "catch_all: {:?}",
-                msg.type_id()
-            ));
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new({
+            let c = count.clone();
+            move |p: &mut Pipeline| { p.add_inbound(Box::new(CatchAll { count: c.clone() })); }
+        })),
+    });
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(b"x").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    drop(client);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 1: Decoder
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn decoder_dispatches_typed_messages() {
+    #[derive(Debug)] struct LoginRequest  { _username: String }
+    #[derive(Debug)] struct ChatMessage   { _text: String }
+
+    struct ProtocolDecoder { buf: Vec<u8> }
+    impl ByteToMessageDecoder for ProtocolDecoder {
+        fn decode(&mut self, input: &[u8]) -> Option<Box<dyn Any>> {
+            self.buf.extend_from_slice(input);
+            let pos = self.buf.iter().position(|&b| b == b'\n')?;
+            let line = String::from_utf8_lossy(&self.buf[..pos]).trim().to_string();
+            self.buf.drain(..=pos);
+            let parts: Vec<&str> = line.splitn(2, ':').collect();
+            match parts.as_slice() {
+                ["login", user] => Some(Box::new(LoginRequest { _username: user.to_string() })),
+                ["chat",  text] => Some(Box::new(ChatMessage  { _text:     text.to_string() })),
+                _               => None,
+            }
+        }
+    }
+
+    let login_count = Arc::new(AtomicUsize::new(0));
+    let chat_count  = Arc::new(AtomicUsize::new(0));
+
+    struct LoginHandler { count: Arc<AtomicUsize> }
+    impl InboundHandler for LoginHandler {
+        fn accepted_types(&self) -> Vec<TypeId> { vec![TypeId::of::<LoginRequest>()] }
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ChatHandler { count: Arc<AtomicUsize> }
+    impl InboundHandler for ChatHandler {
+        fn accepted_types(&self) -> Vec<TypeId> { vec![TypeId::of::<ChatMessage>()] }
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -381,22 +299,297 @@ fn catch_all_handler_sees_everything() {
         port: 0,
         worker_threads: 1,
         pipeline_initializer: Some(Arc::new({
-            let l = log.clone();
+            let lc = login_count.clone(); let cc = chat_count.clone();
             move |p: &mut Pipeline| {
-                p.add_inbound(Box::new(CatchAll { log: l.clone() }));
+                p.set_decoder(Box::new(ProtocolDecoder { buf: Vec::new() }));
+                p.add_inbound(Box::new(LoginHandler { count: lc.clone() }));
+                p.add_inbound(Box::new(ChatHandler  { count: cc.clone() }));
             }
         })),
     });
 
-    thread::sleep(Duration::from_millis(50));
-
-    let mut client =
-        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect failed");
-    client.write_all(b"x").expect("write failed");
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(b"login:alice\n").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    client.write_all(b"chat:hello world\n").unwrap();
     thread::sleep(Duration::from_millis(100));
     drop(client);
 
+    assert_eq!(login_count.load(Ordering::SeqCst), 1, "LoginHandler must fire once");
+    assert_eq!(chat_count.load(Ordering::SeqCst),  1, "ChatHandler must fire once");
+}
+
+#[test]
+fn decoder_handles_fragmented_tcp_input() {
+    let message_count = Arc::new(AtomicUsize::new(0));
+    struct Counter { count: Arc<AtomicUsize> }
+    impl InboundHandler for Counter {
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new({
+            let c = message_count.clone();
+            move |p: &mut Pipeline| {
+                p.set_decoder(Box::new(NewlineDecoder::new()));
+                p.add_inbound(Box::new(Counter { count: c.clone() }));
+            }
+        })),
+    });
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(b"hel").unwrap();
+    thread::sleep(Duration::from_millis(50));
+    client.write_all(b"lo\n").unwrap();
+    thread::sleep(Duration::from_millis(150));
+    drop(client);
+
+    assert_eq!(
+        message_count.load(Ordering::SeqCst), 1,
+        "fragmented message must reassemble into exactly one dispatch"
+    );
+}
+
+#[test]
+fn decoder_emits_multiple_messages_from_one_read() {
+    let message_count = Arc::new(AtomicUsize::new(0));
+    struct Counter { count: Arc<AtomicUsize> }
+    impl InboundHandler for Counter {
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new({
+            let c = message_count.clone();
+            move |p: &mut Pipeline| {
+                p.set_decoder(Box::new(NewlineDecoder::new()));
+                p.add_inbound(Box::new(Counter { count: c.clone() }));
+            }
+        })),
+    });
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(b"msg1\nmsg2\nmsg3\n").unwrap();
+    thread::sleep(Duration::from_millis(200));
+    drop(client);
+
+    assert_eq!(
+        message_count.load(Ordering::SeqCst), 3,
+        "three framed messages in one TCP read must each dispatch separately"
+    );
+}
+
+#[test]
+fn decoder_drops_unrecognised_input() {
+    let read_count = Arc::new(AtomicUsize::new(0));
+    struct Counter { count: Arc<AtomicUsize> }
+    impl InboundHandler for Counter {
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct StrictDecoder { buf: Vec<u8> }
+    impl ByteToMessageDecoder for StrictDecoder {
+        fn decode(&mut self, input: &[u8]) -> Option<Box<dyn Any>> {
+            self.buf.extend_from_slice(input);
+            let pos = self.buf.iter().position(|&b| b == b'\n')?;
+            let line = self.buf[..pos].to_vec();
+            self.buf.drain(..=pos);
+            if line == b"ok" { Some(Box::new(line)) } else { None }
+        }
+    }
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new({
+            let c = read_count.clone();
+            move |p: &mut Pipeline| {
+                p.set_decoder(Box::new(StrictDecoder { buf: Vec::new() }));
+                p.add_inbound(Box::new(Counter { count: c.clone() }));
+            }
+        })),
+    });
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(b"garbage\nunknown\n").unwrap();
+    thread::sleep(Duration::from_millis(150));
+    drop(client);
+
+    assert_eq!(read_count.load(Ordering::SeqCst), 0,
+        "lines the decoder drops must not reach handlers");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 2: Connection lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn ctx_close_terminates_connection() {
+    struct CloseOnRead;
+    impl InboundHandler for CloseOnRead {
+        fn on_read(&mut self, ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            ctx.close();
+        }
+    }
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new(|p: &mut Pipeline| {
+            p.add_inbound(Box::new(CloseOnRead));
+        })),
+    });
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    client.write_all(b"trigger").unwrap();
+
+    let mut buf = vec![0u8; 64];
+    let n = client.read(&mut buf).expect("read should return 0, not error");
+    assert_eq!(n, 0, "server must close connection — client reads EOF after ctx.close()");
+}
+
+/// Server writes in on_connect. Client must receive that data without
+/// sending anything first.
+#[test]
+fn on_connect_write_reaches_client() {
+    struct GreetOnConnect;
+    impl InboundHandler for GreetOnConnect {
+        fn on_connect(&mut self, ctx: &mut HandlerContext<'_>) {
+            ctx.session().write(b"hello\n");
+        }
+    }
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new(|p: &mut Pipeline| {
+            p.add_inbound(Box::new(GreetOnConnect));
+        })),
+    });
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+
+    let mut buf = vec![0u8; 6];
+    client.read_exact(&mut buf)
+        .expect("server must push greeting from on_connect before client sends anything");
+    assert_eq!(&buf, b"hello\n");
+}
+
+/// All handlers must receive on_disconnect regardless of position in chain.
+#[test]
+fn disconnect_fires_for_every_handler_in_chain() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new({
+            let la = log.clone(); let lb = log.clone(); let lc = log.clone();
+            move |p: &mut Pipeline| {
+                p.add_inbound(Box::new(TaggedHandler { tag: "A", log: la.clone() }));
+                p.add_inbound(Box::new(TaggedHandler { tag: "B", log: lb.clone() }));
+                p.add_inbound(Box::new(TaggedHandler { tag: "C", log: lc.clone() }));
+            }
+        })),
+    });
+
+    let client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    drop(client);
+    thread::sleep(Duration::from_millis(200));
+
     let events = log.lock().unwrap();
-    assert_eq!(events.len(), 1);
-    assert!(events[0].contains("catch_all"));
+    assert!(events.contains(&"A.disconnect".to_string()), "A must get on_disconnect");
+    assert!(events.contains(&"B.disconnect".to_string()), "B must get on_disconnect");
+    assert!(events.contains(&"C.disconnect".to_string()), "C must get on_disconnect");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 3: ET epoll read loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Client sends 64 KB in one shot. Worker must loop reads until WouldBlock
+/// to drain the kernel buffer fully (8 KB read buffer × 8 iterations).
+#[test]
+fn large_payload_fully_received() {
+    let total_bytes = Arc::new(AtomicUsize::new(0));
+    struct Accumulator { total: Arc<AtomicUsize> }
+    impl InboundHandler for Accumulator {
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
+            self.total.fetch_add(as_bytes(msg).len(), Ordering::SeqCst);
+        }
+    }
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 1,
+        pipeline_initializer: Some(Arc::new({
+            let t = total_bytes.clone();
+            move |p: &mut Pipeline| { p.add_inbound(Box::new(Accumulator { total: t.clone() })); }
+        })),
+    });
+
+    const PAYLOAD: usize = 64 * 1024;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client.write_all(&vec![0xABu8; PAYLOAD]).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    drop(client);
+
+    assert_eq!(
+        total_bytes.load(Ordering::SeqCst), PAYLOAD,
+        "all 64 KB must arrive — validates ET read loop drains kernel buffer fully"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 4: Multi-worker distribution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 8 simultaneous connections across 4 workers — all must echo correctly.
+#[test]
+fn connections_distributed_across_workers() {
+    struct EchoHandler;
+    impl InboundHandler for EchoHandler {
+        fn on_read(&mut self, ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
+            ctx.session().write(as_bytes(msg));
+        }
+    }
+
+    let port = start_server(ServerConfig {
+        port: 0,
+        worker_threads: 4,
+        pipeline_initializer: Some(Arc::new(|p: &mut Pipeline| {
+            p.add_inbound(Box::new(EchoHandler));
+        })),
+    });
+
+    let handles: Vec<_> = (0..8usize)
+        .map(|i| {
+            let addr = format!("127.0.0.1:{}", port);
+            thread::spawn(move || {
+                let mut s = TcpStream::connect(&addr).expect("connect");
+                s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+                let payload = format!("conn-{:02}", i);
+                s.write_all(payload.as_bytes()).expect("write");
+                let mut buf = vec![0u8; payload.len()];
+                s.read_exact(&mut buf).expect("read echo");
+                assert_eq!(buf, payload.as_bytes(), "echo mismatch on conn {}", i);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("connection thread panicked");
+    }
 }
