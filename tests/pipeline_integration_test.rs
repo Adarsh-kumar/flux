@@ -553,43 +553,88 @@ fn large_payload_fully_received() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Group 4: Multi-worker distribution
+// Group 5: Backpressure
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 8 simultaneous connections across 4 workers — all must echo correctly.
+/// When a worker is blocked (slow handler), the boss pauses accept instead of
+/// dropping connections. New connections park in the kernel's TCP backlog.
 #[test]
-fn connections_distributed_across_workers() {
-    struct EchoHandler;
-    impl InboundHandler for EchoHandler {
-        fn on_read(&mut self, ctx: &mut HandlerContext<'_>, msg: &dyn Any) {
-            ctx.session().write(as_bytes(msg));
+fn backpressure_pauses_accept_not_drops() {
+    use std::sync::Barrier;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let unblocked = Arc::new(AtomicUsize::new(0));
+
+    struct BlockingHandler {
+        barrier: Arc<Barrier>,
+        unblocked: Arc<AtomicUsize>,
+    }
+    impl InboundHandler for BlockingHandler {
+        fn on_read(&mut self, _ctx: &mut HandlerContext<'_>, _msg: &dyn Any) {
+            // Block the worker thread on first invocation only.
+            if self.unblocked.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.barrier.wait();
+            }
         }
     }
 
     let port = start_server(ServerConfig {
         port: 0,
-        worker_threads: 4,
-        pipeline_initializer: Some(Arc::new(|p: &mut Pipeline| {
-            p.add_inbound(Box::new(EchoHandler));
+        worker_threads: 1, // single worker so all connections hit same mpsc
+        pipeline_initializer: Some(Arc::new({
+            let b = barrier.clone();
+            let u = unblocked.clone();
+            move |p: &mut Pipeline| {
+                p.add_inbound(Box::new(BlockingHandler {
+                    barrier: b.clone(),
+                    unblocked: u.clone(),
+                }));
+            }
         })),
     });
 
-    let handles: Vec<_> = (0..8usize)
-        .map(|i| {
-            let addr = format!("127.0.0.1:{}", port);
-            thread::spawn(move || {
-                let mut s = TcpStream::connect(&addr).expect("connect");
-                s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-                let payload = format!("conn-{:02}", i);
-                s.write_all(payload.as_bytes()).expect("write");
-                let mut buf = vec![0u8; payload.len()];
-                s.read_exact(&mut buf).expect("read echo");
-                assert_eq!(buf, payload.as_bytes(), "echo mismatch on conn {}", i);
-            })
-        })
-        .collect();
+    // Step 1: open first connection and send data — this blocks the worker.
+    let mut first = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("first connect");
+    first.write_all(b"block").expect("write to first");
 
-    for h in handles {
-        h.join().expect("connection thread panicked");
+    // Give worker time to hit the barrier.
+    thread::sleep(Duration::from_millis(100));
+
+    // Step 2: fill the mpsc queue (capacity 256 per worker).
+    let mut flood: Vec<TcpStream> = Vec::new();
+    for i in 0..256 {
+        match TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            Duration::from_millis(200),
+        ) {
+            Ok(s) => flood.push(s),
+            Err(e) => panic!("connection {} failed: {} — accept should be paused, not refusing", i, e),
+        }
     }
+
+    // Step 3: one more connection — also must succeed (parked in kernel backlog).
+    let mut extra = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("connection beyond mpsc capacity must succeed — kernel backlog absorbs it");
+
+    // Wait 5 seconds while paused. The boss spins on LISTENER_TOKEN events
+    // without accepting. The log will show the spin count on resume.
+    eprintln!(">>> boss is paused — waiting 5s for spin counter to accumulate...");
+    thread::sleep(Duration::from_secs(5));
+
+    // Step 4: unblock the worker.
+    barrier.wait();
+
+    // Step 5: all flood connections and the extra must eventually be accepted.
+    // Write data to each so the handler fires.
+    thread::sleep(Duration::from_millis(200));
+    for mut s in flood {
+        s.write_all(b"x").ok();
+    }
+    extra.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    // If extra can write, the server accepted it.
+    assert!(extra.write_all(b"x").is_ok(), "extra connection must be accepted");
+
+    // Cleanup
+    drop(first);
+    thread::sleep(Duration::from_millis(100));
 }

@@ -136,14 +136,27 @@ impl Server {
             let _ = (&shutdown_tx).write(&[1u8]);
         });
 
+        // Drain pipes: workers → boss. One pipe per worker. When a worker
+        // frees an mpsc slot it writes 1 byte so the boss can resume
+        // accept() after backpressure.
+        let mut drain_senders = Vec::with_capacity(self.config.worker_threads);
+        let mut drain_receivers = Vec::with_capacity(self.config.worker_threads);
+        for _ in 0..self.config.worker_threads {
+            let (tx, rx) = pipe::new().expect("failed to create drain pipe");
+            drain_senders.push(tx);
+            drain_receivers.push(rx);
+        }
+
         // Spawn workers.
         let initializer = self.config.pipeline_initializer.clone();
-        let workers: Vec<worker::WorkerHandle> = (0..self.config.worker_threads)
-            .map(|id| worker::Worker::spawn(id, initializer.clone()))
+        let workers: Vec<worker::WorkerHandle> = drain_senders
+            .into_iter()
+            .enumerate()
+            .map(|(id, tx)| worker::Worker::spawn(id, initializer.clone(), tx))
             .collect();
 
         // Run the boss accept loop. Blocks until shutdown pipe wakes it.
-        boss::Boss::run(self.config.port, &workers, shutdown, shutdown_rx);
+        boss::Boss::run(self.config.port, &workers, shutdown, shutdown_rx, drain_receivers);
 
         // Boss returned — shutdown initiated. Drop the WorkerHandle vec:
         // closing the pipe senders wakes each worker's epoll immediately

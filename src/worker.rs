@@ -92,6 +92,7 @@ pub struct Worker {
     events: Events,
     rx: mpsc::Receiver<AcceptedConnection>,
     pipe_rx: pipe::Receiver,
+    drain_tx: pipe::Sender,
     connections: HashMap<Token, Session>,
     next_token: usize,
     next_session_id: u64,
@@ -108,6 +109,7 @@ impl Worker {
     pub fn spawn(
         id: usize,
         initializer: Option<Arc<dyn Fn(&mut Pipeline) + Send + Sync>>,
+        drain_tx: pipe::Sender,
     ) -> WorkerHandle {
         let (tx, rx) = mpsc::sync_channel::<AcceptedConnection>(256);
 
@@ -132,6 +134,7 @@ impl Worker {
                     events: Events::with_capacity(1024),
                     rx,
                     pipe_rx,
+                    drain_tx,
                     connections: HashMap::with_capacity(1024),
                     next_token: 1,
                     next_session_id: 1,
@@ -223,6 +226,9 @@ impl Worker {
         loop {
             match self.rx.try_recv() {
                 Ok(conn) => {
+            // Signal boss: we drained a connection, an mpsc slot is free.
+            let _ = (&mut self.drain_tx).write(&[1u8]);
+
             let token = Token(self.next_token);
             self.next_token = self.next_token.wrapping_add(1);
 
