@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, TryRecvError};
@@ -20,6 +20,14 @@ use crate::session::Session;
 /// Token for the wake-up pipe. Session tokens start at 1 and never reach
 /// `usize::MAX`, so there is no collision.
 const WAKE_TOKEN: Token = Token(usize::MAX);
+
+/// Maximum number of `read()` calls per `process_readable` invocation.
+///
+/// Once exhausted the session is pushed onto `carry_over` and given another
+/// pass at the end of the current event-loop iteration before `poll()` is
+/// called again. This bounds the time any single connection can monopolise
+/// the worker thread, preventing head-of-line blocking on co-located sessions.
+const READ_BUDGET: usize = 16;
 
 // ──────────────────────────────────────────
 // AcceptedConnection — sent from boss to worker
@@ -98,6 +106,10 @@ pub struct Worker {
     next_session_id: u64,
     initializer: Option<Arc<dyn Fn(&mut Pipeline) + Send + Sync>>,
     executor: PipelineExecutor,
+    /// Sessions that hit `READ_BUDGET` before `WouldBlock` this iteration.
+    /// Drained at the end of each loop before re-entering `poll()` so their
+    /// remaining kernel buffer data is not stranded waiting for a new ET edge.
+    carry_over: VecDeque<Token>,
 }
 
 impl Worker {
@@ -140,6 +152,7 @@ impl Worker {
                     next_session_id: 1,
                     initializer,
                     executor: PipelineExecutor::new(),
+                    carry_over: VecDeque::new(),
                 };
                 worker.run();
             })
@@ -153,8 +166,12 @@ impl Worker {
         }
     }
 
-    /// The worker event loop. Uses a 500ms poll timeout to periodically
-    /// check for shutdown (when the boss drops the mpsc sender).
+    /// The worker event loop.
+    ///
+    /// Uses `poll(None)` (infinite sleep) when there is no carry-over work.
+    /// Switches to `poll(Some(0))` (non-blocking) when sessions hit the read
+    /// budget mid-iteration so their remaining data is drained before the
+    /// worker sleeps again.
     fn run(&mut self) {
         log::info!("flux: worker {} started", self.id);
 
@@ -168,11 +185,16 @@ impl Worker {
                 return;
             }
 
-            // ── 2. Block until kernel wakes us ──
-            if let Err(e) = self.poll.poll(
-                &mut self.events,
-                Some(Duration::from_millis(500)),
-            ) {
+            // ── 2. Poll ──
+            // Sleep indefinitely when there is no deferred work. Switch to a
+            // non-blocking check when carry-over tokens exist so we collect
+            // any new epoll events and then immediately continue draining.
+            let timeout = if self.carry_over.is_empty() {
+                None
+            } else {
+                Some(Duration::ZERO)
+            };
+            if let Err(e) = self.poll.poll(&mut self.events, timeout) {
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -194,7 +216,7 @@ impl Worker {
                 })
                 .collect();
 
-            // ── 4. Process events ──
+            // ── 4. Process fresh epoll events ──
             for (token, readable, writable, closed) in pending {
                 if token == WAKE_TOKEN {
                     self.drain_pipe();
@@ -212,6 +234,16 @@ impl Worker {
                 if writable {
                     self.process_writable(token);
                 }
+            }
+
+            // ── 5. Drain carry-over tokens (generation swap) ──
+            // mem::take swaps self.carry_over with a fresh empty VecDeque.
+            // Tokens that hit the budget AGAIN during this pass are pushed
+            // into the new self.carry_over (next generation) and handled on
+            // the following iteration — bounding work per outer loop turn.
+            let carry = std::mem::take(&mut self.carry_over);
+            for token in carry {
+                self.process_readable(token, &mut read_buf);
             }
         }
     }
@@ -306,7 +338,19 @@ impl Worker {
             None => return,
         };
 
+        let mut reads: usize = 0;
         loop {
+            if reads >= READ_BUDGET {
+                // Budget exhausted — kernel buffer may still hold data but
+                // continuing would starve co-located sessions. Re-insert and
+                // defer: the carry-over queue will give this token another
+                // READ_BUDGET pass at the end of this iteration (or next if
+                // it was already a carry-over), without blocking on poll().
+                self.carry_over.push_back(token);
+                self.connections.insert(token, session);
+                return;
+            }
+
             match session.read_from_fd(read_buf) {
                 Ok(0) => {
                     log::debug!(
@@ -320,6 +364,7 @@ impl Worker {
                     return;
                 }
                 Ok(n) => {
+                    reads += 1;
                     if self.executor.fire_read(&session, &read_buf[..n]) {
                         self.terminate(session);
                         return;
@@ -327,7 +372,7 @@ impl Worker {
                     // Handler left the session open — continue draining.
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // Kernel buffer fully drained — stop reading.
+                    // Kernel buffer fully drained — no carry-over needed.
                     break;
                 }
                 Err(e) => {
@@ -347,7 +392,7 @@ impl Worker {
             }
         }
 
-        // Kernel buffer drained and session is still open.
+        // Kernel buffer fully drained — session still open.
         // Reconcile WRITABLE interest with the session's write buffer.
         update_writable(&self.poll, &mut session, token, self.id);
         self.connections.insert(token, session);
